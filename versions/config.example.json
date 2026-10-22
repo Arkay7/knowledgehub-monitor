@@ -1,0 +1,7 @@
+{
+  "host": {
+    "hostname": "monitor-server",
+    "ip_address": "10.0.10.4"
+  },
+  "metrics": ["cpu_usage", "memory_usage", "disk_root_usage"]
+}
