@@ -1,34 +1,35 @@
 """
-monitor.py - Week 3 (Task 11)
-Python Monitoring Scripting (Application Basic)
+monitor.py - Week 3 (version 4)
+Knowledge Hub system monitor.
 
-Command-line monitoring application with SQLite3-backed persistent
-storage. Configuration (which system to monitor and which metrics to
-track) is supplied via a JSON config file - the application never
-pauses to ask for interactive input, so it can be scheduled or scripted.
-
-See README.md for the full data model, output/log format and usage
-instructions.
+Measures CPU, memory and disk usage, stores them in a SQLite3 database
+and reports stored measurements over a chosen time period. The tool never
+asks for input, so it can run on a schedule. Everything it does is also
+written to monitor.log.
 
 Usage:
     python monitor.py record --config config.json
     python monitor.py record --config config.json --reset
     python monitor.py report
-    python monitor.py report --start 2026-10-01T00:00:00 --end 2026-10-04T23:59:59 --stats
+    python monitor.py report --start 2026-10-01T00:00:00 --stats
+    python monitor.py --help
 """
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
+import sys
 from datetime import datetime
 
 import psutil
 
 DB_FILE = "data/monitoring.db"
+LOG_FILE = "monitor.log"
 
-# Maps a metric name (as entered by the user in the config file) to the
-# function that measures it. New metrics can be added here.
+# Maps a metric name (as used in the config file) to the function that
+# measures it. A new metric only needs one new line here.
 METRIC_FUNCTIONS = {
     "cpu_usage": lambda: psutil.cpu_percent(interval=1),
     "memory_usage": lambda: psutil.virtual_memory().percent,
@@ -36,14 +37,23 @@ METRIC_FUNCTIONS = {
 }
 
 
+def setup_logging():
+    """Write log lines with date, time and level to monitor.log."""
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
 def load_config(path):
-    """Load the monitoring configuration (host info + metrics) from JSON."""
+    """Load the host information and metric list from a JSON file."""
     with open(path, "r", encoding="utf-8") as config_file:
         return json.load(config_file)
 
 
 def get_connection():
-    """Open the SQLite3 database, creating the table if needed."""
+    """Open the SQLite3 database and create the table if needed."""
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     connection = sqlite3.connect(DB_FILE)
     connection.execute(
@@ -62,16 +72,18 @@ def get_connection():
 
 
 def reset_database():
-    """Delete the existing database so recording starts with a clean slate."""
+    """Delete the database so recording starts with a clean slate."""
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)
+    logging.warning("Database reset, all stored data deleted")
     print("Database reset - starting with a clean slate.")
 
 
 def record_measurements(config, reset=False):
-    """Measure every configured metric once and insert the results into
-    the SQLite3 database. Existing data is never overwritten, unless
-    --reset was explicitly given."""
+    """Measure every configured metric once and add it to the database.
+
+    Existing data is never overwritten, unless --reset is given.
+    """
     if reset:
         reset_database()
 
@@ -83,14 +95,18 @@ def record_measurements(config, reset=False):
     for metric in config["metrics"]:
         measure = METRIC_FUNCTIONS.get(metric)
         if measure is None:
+            logging.warning("Unknown metric '%s' skipped", metric)
             print(f"Warning: unknown metric '{metric}', skipping.")
             continue
         value = measure()
         connection.execute(
-            "INSERT INTO measurements (timestamp, hostname, ip_address, metric, value) "
+            "INSERT INTO measurements "
+            "(timestamp, hostname, ip_address, metric, value) "
             "VALUES (?, ?, ?, ?, ?)",
             (timestamp, host["hostname"], host["ip_address"], metric, value),
         )
+        logging.info("Recorded %s = %.2f on %s", metric, value,
+                     host["hostname"])
         count += 1
 
     connection.commit()
@@ -99,11 +115,10 @@ def record_measurements(config, reset=False):
 
 
 def report_measurements(start=None, end=None, show_stats=False):
-    """Query stored measurements from the database, optionally filtered
-    by a start/end time window, and display them in a well-formatted
-    table."""
+    """Show stored measurements, optionally between a start and end time."""
     connection = get_connection()
-    query = "SELECT timestamp, hostname, metric, value FROM measurements WHERE 1=1"
+    query = ("SELECT timestamp, hostname, metric, value "
+             "FROM measurements WHERE 1=1")
     params = []
     if start:
         query += " AND timestamp >= ?"
@@ -115,6 +130,7 @@ def report_measurements(start=None, end=None, show_stats=False):
 
     rows = connection.execute(query, params).fetchall()
     connection.close()
+    logging.info("Report requested, %d rows found", len(rows))
 
     if not rows:
         print("No data found for the given period.")
@@ -132,34 +148,63 @@ def report_measurements(start=None, end=None, show_stats=False):
         print("\nStatistics:")
         for metric, values in by_metric.items():
             average = sum(values) / len(values)
-            print(f"  {metric}: count={len(values)} avg={average:.2f} total={sum(values):.2f}")
+            print(f"  {metric}: count={len(values)} "
+                  f"avg={average:.2f} total={sum(values):.2f}")
+
+
+def parse_time(text, option):
+    """Turn user input into a datetime, or stop with a clear message."""
+    try:
+        return datetime.fromisoformat(text) if text else None
+    except ValueError:
+        logging.error("Invalid date for %s: %s", option, text)
+        print(f"Error: {option} must look like 2026-10-01T00:00:00 "
+              f"(got '{text}').")
+        sys.exit(1)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Knowledge Hub system monitor")
+    """Define the command-line options (argparse also builds --help)."""
+    parser = argparse.ArgumentParser(
+        description="Knowledge Hub system monitor")
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
-    record_parser = subparsers.add_parser("record", help="Perform and store measurements")
-    record_parser.add_argument("--config", required=True, help="Path to JSON config file")
-    record_parser.add_argument("--reset", action="store_true", help="Start with a clean database")
+    record = subparsers.add_parser(
+        "record", help="Measure and store the configured metrics")
+    record.add_argument("--config", required=True,
+                        help="Path to the JSON config file")
+    record.add_argument("--reset", action="store_true",
+                        help="Delete all stored data first")
 
-    report_parser = subparsers.add_parser("report", help="Retrieve and display stored measurements")
-    report_parser.add_argument("--start", help="Start date/time (YYYY-MM-DDTHH:MM:SS)")
-    report_parser.add_argument("--end", help="End date/time (YYYY-MM-DDTHH:MM:SS)")
-    report_parser.add_argument("--stats", action="store_true", help="Show average/total per metric")
-
+    report = subparsers.add_parser(
+        "report", help="Show stored measurements")
+    report.add_argument("--start", help="From (YYYY-MM-DDTHH:MM:SS)")
+    report.add_argument("--end", help="Until (YYYY-MM-DDTHH:MM:SS)")
+    report.add_argument("--stats", action="store_true",
+                        help="Show average and total per metric")
     return parser.parse_args()
 
 
 def main():
+    """Run the chosen mode and report errors clearly."""
+    setup_logging()
     args = parse_args()
-    if args.mode == "record":
-        config = load_config(args.config)
-        record_measurements(config, reset=args.reset)
-    elif args.mode == "report":
-        start = datetime.fromisoformat(args.start) if args.start else None
-        end = datetime.fromisoformat(args.end) if args.end else None
-        report_measurements(start=start, end=end, show_stats=args.stats)
+    try:
+        if args.mode == "record":
+            record_measurements(load_config(args.config), reset=args.reset)
+        else:
+            report_measurements(
+                start=parse_time(args.start, "--start"),
+                end=parse_time(args.end, "--end"),
+                show_stats=args.stats)
+    except FileNotFoundError:
+        logging.error("Config file not found: %s", args.config)
+        print(f"Error: config file '{args.config}' not found.")
+        sys.exit(1)
+    except (KeyError, json.JSONDecodeError) as error:
+        logging.error("Config file problem: %s", error)
+        print(f"Error: the config file is not valid ({error}).")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
