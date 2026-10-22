@@ -1,29 +1,31 @@
 """
-monitor.py - Week 2 (Task 10)
-Continued Scripting (Application Basic)
+monitor.py - Week 3 (Task 11)
+Python Monitoring Scripting (Application Basic)
 
-Command-line monitoring application. Configuration (which system to
-monitor and which metrics to track) is supplied via a JSON config file -
-the application never pauses to ask for interactive input, so it can be
-scheduled or scripted.
+Command-line monitoring application with SQLite3-backed persistent
+storage. Configuration (which system to monitor and which metrics to
+track) is supplied via a JSON config file - the application never
+pauses to ask for interactive input, so it can be scheduled or scripted.
+
+See README.md for the full data model, output/log format and usage
+instructions.
 
 Usage:
     python monitor.py record --config config.json
     python monitor.py record --config config.json --reset
-    python monitor.py report --config config.json
+    python monitor.py report
     python monitor.py report --start 2026-10-01T00:00:00 --end 2026-10-04T23:59:59 --stats
 """
 
 import argparse
-import csv
 import json
 import os
+import sqlite3
 from datetime import datetime
 
 import psutil
 
-DATA_FILE = "data/measurements.csv"
-FIELDNAMES = ["timestamp", "hostname", "ip_address", "metric", "value"]
+DB_FILE = "data/monitoring.db"
 
 # Maps a metric name (as entered by the user in the config file) to the
 # function that measures it. New metrics can be added here.
@@ -40,76 +42,93 @@ def load_config(path):
         return json.load(config_file)
 
 
-def ensure_data_file(reset=False):
-    """Create the data file (with header) if it doesn't exist yet,
-    or if the caller explicitly asked for a clean slate."""
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    if reset or not os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "w", newline="", encoding="utf-8") as data_file:
-            writer = csv.DictWriter(data_file, fieldnames=FIELDNAMES)
-            writer.writeheader()
+def get_connection():
+    """Open the SQLite3 database, creating the table if needed."""
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    connection = sqlite3.connect(DB_FILE)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS measurements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            ip_address TEXT NOT NULL,
+            metric TEXT NOT NULL,
+            value REAL NOT NULL
+        )
+        """
+    )
+    return connection
+
+
+def reset_database():
+    """Delete the existing database so recording starts with a clean slate."""
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    print("Database reset - starting with a clean slate.")
 
 
 def record_measurements(config, reset=False):
-    """Measure every configured metric once and append the results
-    to permanent storage (disk). Existing data is never overwritten,
-    unless --reset was explicitly given."""
-    ensure_data_file(reset=reset)
+    """Measure every configured metric once and insert the results into
+    the SQLite3 database. Existing data is never overwritten, unless
+    --reset was explicitly given."""
+    if reset:
+        reset_database()
+
+    connection = get_connection()
     host = config["host"]
     timestamp = datetime.now().isoformat(timespec="seconds")
 
-    rows = []
+    count = 0
     for metric in config["metrics"]:
         measure = METRIC_FUNCTIONS.get(metric)
         if measure is None:
             print(f"Warning: unknown metric '{metric}', skipping.")
             continue
         value = measure()
-        rows.append({
-            "timestamp": timestamp,
-            "hostname": host["hostname"],
-            "ip_address": host["ip_address"],
-            "metric": metric,
-            "value": value,
-        })
+        connection.execute(
+            "INSERT INTO measurements (timestamp, hostname, ip_address, metric, value) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (timestamp, host["hostname"], host["ip_address"], metric, value),
+        )
+        count += 1
 
-    with open(DATA_FILE, "a", newline="", encoding="utf-8") as data_file:
-        writer = csv.DictWriter(data_file, fieldnames=FIELDNAMES)
-        writer.writerows(rows)
-
-    print(f"Recorded {len(rows)} measurement(s) at {timestamp}.")
-
-
-def _in_range(row, start, end):
-    row_time = datetime.fromisoformat(row["timestamp"])
-    if start and row_time < start:
-        return False
-    if end and row_time > end:
-        return False
-    return True
+    connection.commit()
+    connection.close()
+    print(f"Recorded {count} measurement(s) at {timestamp}.")
 
 
 def report_measurements(start=None, end=None, show_stats=False):
-    """Read stored measurements from disk, optionally filter them by a
-    start/end time window, and display them in a well-formatted table."""
-    if not os.path.exists(DATA_FILE):
-        print("No data recorded yet.")
+    """Query stored measurements from the database, optionally filtered
+    by a start/end time window, and display them in a well-formatted
+    table."""
+    connection = get_connection()
+    query = "SELECT timestamp, hostname, metric, value FROM measurements WHERE 1=1"
+    params = []
+    if start:
+        query += " AND timestamp >= ?"
+        params.append(start.isoformat(timespec="seconds"))
+    if end:
+        query += " AND timestamp <= ?"
+        params.append(end.isoformat(timespec="seconds"))
+    query += " ORDER BY timestamp"
+
+    rows = connection.execute(query, params).fetchall()
+    connection.close()
+
+    if not rows:
+        print("No data found for the given period.")
         return
-
-    with open(DATA_FILE, "r", newline="", encoding="utf-8") as data_file:
-        rows = list(csv.DictReader(data_file))
-
-    filtered = [row for row in rows if _in_range(row, start, end)]
 
     print(f"{'Timestamp':20} {'Hostname':15} {'Metric':20} {'Value':>10}")
     print("-" * 68)
-    for row in filtered:
-        print(f"{row['timestamp']:20} {row['hostname']:15} {row['metric']:20} {row['value']:>10}")
+    for timestamp, hostname, metric, value in rows:
+        print(f"{timestamp:20} {hostname:15} {metric:20} {value:>10.2f}")
 
-    if show_stats and filtered:
+    if show_stats:
         by_metric = {}
-        for row in filtered:
-            by_metric.setdefault(row["metric"], []).append(float(row["value"]))
+        for _, _, metric, value in rows:
+            by_metric.setdefault(metric, []).append(value)
         print("\nStatistics:")
         for metric, values in by_metric.items():
             average = sum(values) / len(values)
@@ -122,7 +141,7 @@ def parse_args():
 
     record_parser = subparsers.add_parser("record", help="Perform and store measurements")
     record_parser.add_argument("--config", required=True, help="Path to JSON config file")
-    record_parser.add_argument("--reset", action="store_true", help="Start with a clean data file")
+    record_parser.add_argument("--reset", action="store_true", help="Start with a clean database")
 
     report_parser = subparsers.add_parser("report", help="Retrieve and display stored measurements")
     report_parser.add_argument("--start", help="Start date/time (YYYY-MM-DDTHH:MM:SS)")
