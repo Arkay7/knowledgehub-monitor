@@ -78,7 +78,7 @@ function Deploy {
 }
 
 function Test {
-    $results = @()
+    $script:results = @()
     function Check($name, [scriptblock]$test) {
         try   { $detail = & $test; $r = "PASS" }
         catch { $detail = $_.Exception.Message; $r = "FAIL" }
@@ -112,10 +112,10 @@ function Test {
         if (-not (Test-Path "\\$dns\SYSVOL\$dns\Policies\$id\User\Preferences\Drives\Drives.xml")) { throw "not found" }; "found"
     }
 
-    $results | Format-Table -AutoSize -Wrap
+    $script:results | Format-Table -AutoSize -Wrap
     "=== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ===" | Out-File "$PSScriptRoot\validation.log" -Append
-    ($results | Format-Table -AutoSize -Wrap | Out-String) | Out-File "$PSScriptRoot\validation.log" -Append
-    $failed = @($results | Where-Object Result -eq "FAIL").Count
+    ($script:results | Format-Table -AutoSize -Wrap | Out-String) | Out-File "$PSScriptRoot\validation.log" -Append
+    $failed = @($script:results | Where-Object Result -eq "FAIL").Count
     if ($failed -eq 0) { Write-Host "ALL CHECKS PASSED" -ForegroundColor Green } else { Write-Host "$failed CHECK(S) FAILED (see validation.log)" -ForegroundColor Red }
 }
 
